@@ -21,7 +21,7 @@ The script implements a multi-step search strategy to maximise match rates:
 4. Fuzzy Alternatives: If still no match found, use name_backbone() with
    verbose=True to retrieve alternative matches. These alternatives are filtered
    by phylum (and optionally family) to catch misspellings while avoiding
-   spurious matches (e.g., "Etone flava" → "Eteone flava")
+   spurious matches (e.g., "Etone flava" -> "Eteone flava")
 
 Usage:
     python 02_gbif_backbone_search.py --input input.csv --output output/results.csv
@@ -41,7 +41,7 @@ Output:
     - gbif_notes: Indicates if match required homonym resolution, disambiguation,
       fuzzy lookup, or records failure reasons (api_error, no_match_found,
       disambiguation_failed, fuzzy_search_failed)
-      
+
 Author: Dan Parsons @NHMUK
 """
 
@@ -55,9 +55,7 @@ import time
 from datetime import datetime
 
 
-# GBIF fields to capture from backbone search
-# Note: 'synonym' field removed as it's redundant with 'status' (which returns
-# SYNONYM, ACCEPTED, etc.) and was not reliably populated by the API
+# GBIF fields to capture from backbone search Note: 'synonym' field removed as it's redundant with 'status' (which returns SYNONYM, ACCEPTED, etc.) and was not reliably populated by the API
 GBIF_FIELDS = [
     'usageKey',
     'scientificName',
@@ -86,6 +84,92 @@ GBIF_FIELDS = [
 # Ranks that are too broad to be useful
 INVALID_RANKS = {'KINGDOM', 'PHYLUM'}
 
+
+# === translate the v2 response into the flat v1 field set ========
+#
+# In v2 the classification is a list, one entry per rank, rather than named
+# fields. Only the ranks in GBIF_FIELDS are kept - v2 can also return DOMAIN,
+# SUBPHYLUM, SECTION_BOTANY and others, which are ignored.
+
+CLASSIFICATION_RANKS = {
+    'KINGDOM': 'kingdom',
+    'PHYLUM': 'phylum',
+    'CLASS': 'class',
+    'ORDER': 'order',
+    'FAMILY': 'family',
+    'GENUS': 'genus',
+    'SPECIES': 'species',
+}
+
+
+def normalise_v2(response):
+    """
+    Flatten a GBIF v2 species/match response into the flat GBIF_FIELDS set from v1.
+
+    Needed because pygbif 0.6.6 switched to GBIF's v2 endpoint, which nests
+    the fields (usage, classification, diagnostics) rather than returning
+    them flat. Everything downstream still reads the v1 field names.
+
+    Args:
+        response: dict from species.name_backbone(), or one element of
+                  response['diagnostics']['alternatives']
+
+    Returns:
+        dict: every key in GBIF_FIELDS, with 'NOT_FOUND' where absent
+    """    
+    
+    flat = {field: 'NOT_FOUND' for field in GBIF_FIELDS}
+
+    if not response:
+        return flat
+
+    # Not every response has a 'usage' section: a verbose search that finds nothing returns only 'diagnostics' and 'synonym'.	
+    usage = response.get('usage')
+    if not usage:
+        usage = response if response.get('key') is not None else {}
+
+# if a response ever carries its name fields at the top level, read them there rather than silently returning NOT_FOUND for everything.		
+    accepted = response.get('acceptedUsage') or {}
+    diagnostics = response.get('diagnostics') or {}
+
+    # Match details sit under 'diagnostics' in a full response, but at the top level in an alternative entry.
+    match_type = diagnostics.get('matchType', response.get('matchType'))
+    confidence = diagnostics.get('confidence', response.get('confidence'))
+    note = diagnostics.get('note', response.get('note'))
+
+    if usage.get('key') is not None:
+        flat['usageKey'] = usage['key']
+    if usage.get('name') is not None:
+        flat['scientificName'] = usage['name']
+    if usage.get('canonicalName') is not None:
+        flat['canonicalName'] = usage['canonicalName']
+    if usage.get('rank') is not None:
+        flat['rank'] = usage['rank']
+    if usage.get('status') is not None:
+        flat['status'] = usage['status']
+
+    if accepted.get('key') is not None:
+        flat['acceptedUsageKey'] = accepted['key']
+
+    if match_type is not None:
+        flat['matchType'] = match_type
+
+    # 'is not None' so that a confidence of 0 is kept, not treated as missing.
+    if confidence is not None:
+        flat['confidence'] = confidence
+    if note is not None and 'note' in flat:
+        flat['note'] = note
+
+    for entry in response.get('classification') or []:
+        field = CLASSIFICATION_RANKS.get(str(entry.get('rank', '')).upper())
+        if not field:
+            continue
+        if entry.get('name') is not None:
+            flat[field] = entry['name']
+        if entry.get('key') is not None:
+            flat[f'{field}Key'] = entry['key']
+
+    return flat
 
 def setup_logging(output_dir, prefix):
     """Set up logging to both file and console."""
@@ -135,7 +219,9 @@ def is_valid_gbif_result(result):
     if result.get('matchType') == 'NONE':
         return False
     usage_key = result.get('usageKey')
-    if not usage_key or usage_key == 'NOT_FOUND' or usage_key == 1:
+    # V2 CHANGE 2: v2 returns keys as strings, so "1" == 1 is False. Compare as
+    # text or the root Animalia check never fires.
+    if not usage_key or str(usage_key) in ('NOT_FOUND', '1'):
         return False
     if result.get('rank') in INVALID_RANKS:
         return False
@@ -193,15 +279,19 @@ def search_gbif_backbone(scientific_name, logger, phylum=None, order=None, famil
             # Try both parameter names for compatibility with different pygbif versions
             try:
                 # Newer versions use 'scientificName'
-                result = species.name_backbone(scientificName=scientific_name, **search_params)
+                raw_result = species.name_backbone(scientificName=scientific_name, **search_params)
             except TypeError:
                 # Older versions use 'name'
-                result = species.name_backbone(name=scientific_name, **search_params)
-            
+                raw_result = species.name_backbone(name=scientific_name, **search_params)
+
+            # flatten the nested v2 response before reading fields
+            result = normalise_v2(raw_result)
+
             # Check if we got a match
-            if result.get('matchType') == 'NONE' or not result.get('usageKey'):
+            if result.get('matchType') == 'NONE' or result.get('usageKey') == 'NOT_FOUND':
                 logger.info(f"No match found for '{scientific_name}'")
                 no_match_result = {field: 'NOT_FOUND' for field in GBIF_FIELDS}
+                no_match_result['matchType'] = 'NONE'
                 no_match_result['_no_match'] = True
                 return no_match_result
             
@@ -211,17 +301,8 @@ def search_gbif_backbone(scientific_name, logger, phylum=None, order=None, famil
                        f"rank: {result.get('rank')}, "
                        f"confidence: {result.get('confidence')}, "
                        f"status: {result.get('status')})")
-            
-            # Extract requested fields
-            extracted = {}
-            for field in GBIF_FIELDS:
-                value = result.get(field)
-                if value is None:
-                    extracted[field] = 'NOT_FOUND'
-                else:
-                    extracted[field] = value
-            
-            return extracted
+
+            return result
             
         except Exception as e:
             logger.warning(f"API request failed for '{scientific_name}': {str(e)}")
@@ -283,7 +364,8 @@ def search_gbif_with_disambiguation(scientific_name, logger, phylum=None, order=
     
     if has_taxonomy:
         # Log why we're disambiguating
-        if result.get('usageKey') == 1:
+        # compare the key as text
+        if str(result.get('usageKey')) == '1':
             logger.info(f"Initial search returned usageKey=1 (Animalia) for '{scientific_name}', attempting disambiguation")
         elif result.get('rank') in INVALID_RANKS:
             logger.info(f"Initial search returned too broad rank ({result.get('rank')}) for '{scientific_name}', attempting disambiguation")
@@ -371,13 +453,18 @@ def search_gbif_fuzzy(scientific_name, logger, phylum=None, family=None, max_ret
             # Call GBIF backbone API with verbose=True
             # Try both parameter names for compatibility with different pygbif versions
             try:
-                result = species.name_backbone(scientificName=scientific_name, **search_params)
+                raw_result = species.name_backbone(scientificName=scientific_name, **search_params)
             except TypeError:
-                result = species.name_backbone(name=scientific_name, **search_params)
-            
-            # Check if we got alternatives
-            alternatives = result.get('alternatives', [])
-            
+                raw_result = species.name_backbone(name=scientific_name, **search_params)
+
+            # in v2, the alternatives sit under 'diagnostics' rather than at the top level, and each is nested like a full response, so
+            # flatten each one before filtering. Falls back to the v1 location so
+            # this still works on an older pygbif.
+            raw_alternatives = (raw_result.get('diagnostics') or {}).get('alternatives')
+            if raw_alternatives is None:
+                raw_alternatives = raw_result.get('alternatives', [])
+            alternatives = [normalise_v2(alt) for alt in raw_alternatives]
+
             if not alternatives:
                 logger.info(f"No fuzzy alternatives found for '{scientific_name}'")
                 return {field: 'NOT_FOUND' for field in GBIF_FIELDS}, False, 'fuzzy_search_failed'
@@ -414,25 +501,20 @@ def search_gbif_fuzzy(scientific_name, logger, phylum=None, family=None, max_ret
                 candidates = fuzzy_candidates
             
             # Sort by confidence (highest first) and take the top candidate
-            candidates.sort(key=lambda x: x.get('confidence', 0), reverse=True)
-            top_match = candidates[0]
-            
+            # Confidence may be the string 'NOT_FOUND' after flattening, so guard the sort key
+            candidates.sort(
+                key=lambda x: x.get('confidence') if isinstance(x.get('confidence'), (int, float)) else 0,
+                reverse=True
+            )
+            extracted = dict(candidates[0])
+
             # Log successful match
-            logger.info(f"Fuzzy alternative found: {top_match.get('scientificName')} "
-                       f"(canonicalName: {top_match.get('canonicalName')}, "
-                       f"matchType: {top_match.get('matchType')}, "
-                       f"confidence: {top_match.get('confidence')}, "
-                       f"phylum: {top_match.get('phylum')})")
-            
-            # Extract requested fields
-            extracted = {}
-            for field in GBIF_FIELDS:
-                value = top_match.get(field)
-                if value is None:
-                    extracted[field] = 'NOT_FOUND'
-                else:
-                    extracted[field] = value
-            
+            logger.info(f"Fuzzy alternative found: {extracted.get('scientificName')} "
+                       f"(canonicalName: {extracted.get('canonicalName')}, "
+                       f"matchType: {extracted.get('matchType')}, "
+                       f"confidence: {extracted.get('confidence')}, "
+                       f"phylum: {extracted.get('phylum')})")
+
             # Ensure matchType reflects this was from fuzzy alternatives
             if extracted.get('matchType') != 'FUZZY':
                 extracted['matchType'] = 'FUZZY_ALTERNATIVE'
@@ -494,9 +576,12 @@ def process_csv(input_file, output_file, logger):
         logger.info("Optional 'order' column not found - disambiguation will use phylum and family only")
     
     # Initialize GBIF result columns with prefix
+    # Create these as dtype=object. v2 returns confidence as an
+    # integer, and pandas >= 2.2 infers a string dtype from the 'NOT_FOUND'
+    # placeholder, then raises TypeError when an int is written into it.
     for field in GBIF_FIELDS:
-        df[f'gbif_{field}'] = 'NOT_FOUND'
-    
+        df[f'gbif_{field}'] = pd.Series(['NOT_FOUND'] * len(df), index=df.index, dtype=object)
+
     # Initialize notes column
     df['gbif_notes'] = ''
     
