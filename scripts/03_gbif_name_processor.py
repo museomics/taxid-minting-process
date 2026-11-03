@@ -45,11 +45,28 @@ Decision Logic:
     - Not a possible combination: Certain rule combinations flagged as logically
       impossible in the rules matrix.
 
+    Higher Taxonomy Checks:
+    The rules matrix only compares name spellings, so two extra checks compare
+    the input higher taxonomy against the GBIF match. A value is only compared
+    when it is present on both sides (not empty / NOT_FOUND / 'not collected'),
+    case-insensitively.
+    - Phylum check (all rows): if the input phylum differs from gbif_phylum,
+      manual_verification_needed is set to yes. This catches cross-phylum
+      homonyms that ENA could not (e.g. an input bryozoan matched by GBIF to a
+      millipede of the same name).
+    - GBIF spelling corrections (name_to_use == 'gbif', check_ENA_with_GBIF ==
+      yes, no manual verification from the rules): if phylum, class, order OR
+      family differs, manual_verification_needed is set to yes (e.g. an input
+      with an incorrect higher taxonomy that GBIF matched to a differently
+      placed genus).
+
     Manual Verification:
     The following outcomes automatically trigger manual_verification_needed = yes:
     - "uncertain - check placement"
     - "not a possible combination"
     - Any rule where 'manual verification needed' is 'yes' in the rules matrix
+    - A phylum mismatch between input and GBIF (any row)
+    - A phylum/class/order/family mismatch on a GBIF spelling-correction row
 
 Output Files:
     1. {basename}_request_taxid.tsv
@@ -59,12 +76,12 @@ Output Files:
          - Only includes rows where name_to_use == 'original' AND
            manual_verification_needed != 'yes'
          - Deduplicated by proposed_name (unique species names only)
-         - Description contains GBIF URL; falls back to gbif_genusKey if
-           gbif_speciesKey is empty/NOT_FOUND (these rows are also added to
-           manually_verify.xlsx)
+         - Description contains the GBIF species URL (gbif_speciesKey). If no
+           gbif_speciesKey is available the row is NOT written here; it is set
+           to manual_verification_needed = yes and sent to manually_verify.xlsx
          - Type specimens are annotated with "| TYPE" appended to description
-         - name_type is 'published_name' when gbif_speciesKey is used, or
-           'novel_species' when falling back to gbif_genusKey
+         - name_type is always 'published_name'. Genus-level and higher requests
+           are handled separately by requester_non-species.py
 
     2. {basename}_check_ENA.xlsx
        Names where the GBIF name should be used, requiring ENA validation.
@@ -79,10 +96,16 @@ Output Files:
        Rows flagged for manual verification, containing all original input columns
        plus decision columns: name_to_use, description_text, check_ENA_with_GBIF,
        manual_verification_needed.
-       Includes rows with the following name_to_use values:
-         - "uncertain - check placement"
-         - "not a possible combination"
-         - Any row where manual_verification_needed == 'yes' from rules matrix
+       Includes:
+         - "uncertain - check placement" rows
+         - "not a possible combination" rows
+         - Any row where manual_verification_needed == 'yes' (rules matrix,
+           phylum mismatch, or missing gbif_speciesKey on an 'original' row)
+         - ALL GBIF spelling-correction rows (name_to_use == 'gbif',
+           check_ENA_with_GBIF == 'yes'), so that every species still needing
+           an ENA check is in this one file. Those without a higher-taxonomy
+           mismatch keep manual_verification_needed blank; confirmed_taxonomy
+           must still be filled in for them during manual verification.
 
     5. {basename}.log
        Detailed log file containing:
@@ -195,6 +218,29 @@ def compare_names(original: str, gbif: str) -> str:
     return 'same' if original.strip().lower() == gbif.strip().lower() else 'different'
 
 
+EMPTY_TAXON_VALUES = ('', 'nan', 'none', 'not_found', 'not collected')
+
+
+def higher_taxonomy_mismatches(row: dict, levels) -> list:
+    """
+    Compare input higher taxonomy against the GBIF match for the given levels.
+
+    A level is only compared when both the input value (e.g. 'phylum') and the
+    GBIF value (e.g. 'gbif_phylum') are present. Comparison is case-insensitive.
+
+    Returns a list of (level, input_value, gbif_value) tuples for each mismatch.
+    """
+    mismatches = []
+    for level in levels:
+        input_value = (row.get(level) or '').strip()
+        gbif_value = (row.get(f'gbif_{level}') or '').strip()
+        if input_value.lower() in EMPTY_TAXON_VALUES or gbif_value.lower() in EMPTY_TAXON_VALUES:
+            continue
+        if input_value.lower() != gbif_value.lower():
+            mismatches.append((level, input_value, gbif_value))
+    return mismatches
+
+
 def check_genus_mismatch_case(status: str, match_type: str, species_match: str, genus_match: str) -> bool:
     """
     Check if this is a genus mismatch case that should be flagged specially.
@@ -229,7 +275,6 @@ def process_row(row: dict, rules: dict, logger: Logger) -> dict:
     gbif_genus = row.get('gbif_genus', '').strip()
     gbif_family = row.get('gbif_family', '').strip()
     gbif_key = row.get('gbif_speciesKey', '').strip()
-    gbif_genus_key = row.get('gbif_genusKey', '').strip()
     sample_id = row.get('ID', '').strip()
     
     # Determine if type specimen
@@ -279,7 +324,24 @@ def process_row(row: dict, rules: dict, logger: Logger) -> dict:
     if rule['name_to_use'] in ('not a possible combination', 'uncertain - check placement'):
         rule = rule.copy()  # Don't modify the original rule dict
         rule['manual_verification'] = True
-    
+
+    # Higher taxonomy checks (see module docstring)
+    # GBIF spelling corrections: compare phylum, class, order and family.
+    # All other rows: compare phylum only.
+    is_gbif_correction = (
+        rule['name_to_use'] == 'gbif'
+        and rule['check_ena']
+        and not rule['manual_verification']
+    )
+    if is_gbif_correction:
+        taxonomy_mismatches = higher_taxonomy_mismatches(row, ('phylum', 'class', 'order', 'family'))
+    else:
+        taxonomy_mismatches = higher_taxonomy_mismatches(row, ('phylum',))
+
+    if taxonomy_mismatches:
+        rule = rule.copy()
+        rule['manual_verification'] = True
+
     # Format description text (replace [original] placeholder)
     description_text = rule['description_text']
     if '[original]' in description_text:
@@ -298,6 +360,8 @@ def process_row(row: dict, rules: dict, logger: Logger) -> dict:
     logger.log(f"  Type specimen: {'YES' if is_type else 'NO'}")
     logger.log(f"  Rule key: ({status}, {match_type}, {species_match}, {genus_match}, {'YES' if is_type else 'NO'})")
     logger.log(f"  Rule source: {rule_source}")
+    for level, input_value, gbif_value in taxonomy_mismatches:
+        logger.log(f"  → {level.upper()} MISMATCH: input '{input_value}' | GBIF '{gbif_value}'")
     logger.log(f"  → name_to_use: {rule['name_to_use']}")
     if rule['manual_verification']:
         logger.log(f"  → manual_verification_needed: YES")
@@ -310,7 +374,6 @@ def process_row(row: dict, rules: dict, logger: Logger) -> dict:
         'check_ena': 'yes' if rule['check_ena'] else '',
         'manual_verification': 'yes' if rule['manual_verification'] else '',
         'gbif_key': gbif_key,
-        'gbif_genus_key': gbif_genus_key,
         'verbatim_name': verbatim_name,
         'gbif_species': gbif_species,
         'gbif_genus': gbif_genus,
@@ -323,7 +386,9 @@ def process_row(row: dict, rules: dict, logger: Logger) -> dict:
         'is_type': is_type,
         'status': status,
         'match_type': match_type,
-        'sample_id': sample_id
+        'sample_id': sample_id,
+        'taxonomy_mismatches': taxonomy_mismatches,
+        'is_gbif_correction': is_gbif_correction
     }
 
 
@@ -372,6 +437,9 @@ def process_file(input_file: str, rules_file: str, output_dir: str = None, proje
     check_ena_rows = []
     annotated_rows = []
     manually_verify_rows = []
+    taxonomy_mismatch_count = 0
+    gbif_correction_count = 0
+    no_species_key_count = 0
 
     # Read input and process
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -389,61 +457,58 @@ def process_file(input_file: str, rules_file: str, output_dir: str = None, proje
             annotated_row['manual_verification_needed'] = result['manual_verification']
             annotated_rows.append(annotated_row)
 
+            # Safety net: an 'original' row without a GBIF species key cannot be
+            # written to the request form (no species-level evidence), so send
+            # it to manual verification instead. This is not expected to occur
+            # with the current rules matrix, as HIGHERRANK matches (the only
+            # matches without a species key) already require manual verification.
+            if (result['name_to_use'] == 'original'
+                    and result['manual_verification'] != 'yes'
+                    and (not result['gbif_key'] or result['gbif_key'].upper() == 'NOT_FOUND')):
+                result['manual_verification'] = 'yes'
+                annotated_row['manual_verification_needed'] = 'yes'
+                no_species_key_count += 1
+                logger.log(f"  → No gbif_speciesKey for '{result['verbatim_name']}' "
+                           f"- excluded from request form, sent to manual verification")
+
+            if result['taxonomy_mismatches']:
+                taxonomy_mismatch_count += 1
+
             # Route to appropriate output
             if result['name_to_use'] == 'original':
                 if result['manual_verification'] != 'yes':
                     proposed_name = result['verbatim_name']
-
-                    gbif_key = result['gbif_key']
-                    used_genus_fallback = False
-                    needs_manual_verify_for_fallback = False
-
-                    if not gbif_key or gbif_key.upper() == 'NOT_FOUND':
-                        gbif_key = result['gbif_genus_key']
-                        used_genus_fallback = True
-                        needs_manual_verify_for_fallback = True
-                        if not gbif_key or gbif_key.upper() == 'NOT_FOUND':
-                            gbif_key = ''
-
                     if proposed_name in original_names:
                         if result['is_type']:
                             original_names[proposed_name]['is_type'] = True
-                        if needs_manual_verify_for_fallback:
-                            original_names[proposed_name]['needs_manual_verify'] = True
-                        if used_genus_fallback:
-                            original_names[proposed_name]['used_genus_fallback'] = True
                     else:
                         original_names[proposed_name] = {
-                            'gbif_key': gbif_key,
-                            'is_type': result['is_type'],
-                            'needs_manual_verify': needs_manual_verify_for_fallback,
-                            'used_genus_fallback': used_genus_fallback
+                            'gbif_key': result['gbif_key'],
+                            'is_type': result['is_type']
                         }
-
-                    if needs_manual_verify_for_fallback:
-                        manually_verify_rows.append(annotated_row.copy())
 
             elif result['name_to_use'] == 'gbif':
                 check_ena_rows.append(row.copy())
 
-            # Add to manual verification if flagged (including 'not a possible combination' and 'uncertain - check placement')
+            # Add to manual verification if flagged (including 'not a possible combination',
+            # 'uncertain - check placement', higher taxonomy mismatches and missing species keys).
+            # GBIF spelling corrections are always added, so that every species still
+            # needing an ENA check is present in the manually_verify file.
             if result['manual_verification'] == 'yes':
                 manually_verify_rows.append(annotated_row.copy())
+            elif result['is_gbif_correction']:
+                manually_verify_rows.append(annotated_row.copy())
+                gbif_correction_count += 1
 
     # Build deduplicated original_rows list
     original_rows = []
     for proposed_name, info in original_names.items():
-        gbif_link = f"https://www.gbif.org/species/{info['gbif_key']}" if info['gbif_key'] else ''
-        if info['is_type']:
-            description = f"{gbif_link} | TYPE" if gbif_link else "TYPE"
-        else:
-            description = gbif_link
-
-        name_type = 'novel_species' if info['used_genus_fallback'] else 'published_name'
+        gbif_link = f"https://www.gbif.org/species/{info['gbif_key']}"
+        description = f"{gbif_link} | TYPE" if info['is_type'] else gbif_link
 
         original_rows.append({
             'proposed_name': proposed_name,
-            'name_type': name_type,
+            'name_type': 'published_name',
             'host': '',
             'project_id': project_id,
             'description': description
@@ -512,8 +577,15 @@ def process_file(input_file: str, rules_file: str, output_dir: str = None, proje
     logger.log(f"  uncertain - check placement: {uncertain} records")
     logger.log(f"  not a possible combination: {not_possible} records")
     logger.log(f"")
-    logger.log(f"Manual verification required: {len(manually_verify_rows)} records")
-    
+    logger.log(f"Manual verification required: "
+               f"{len(manually_verify_rows) - gbif_correction_count} records")
+    logger.log(f"  of which have an input vs GBIF higher taxonomy mismatch "
+               f"(search log for 'MISMATCH'): {taxonomy_mismatch_count} records")
+    logger.log(f"  of which have no gbif_speciesKey on an 'original' row: {no_species_key_count} records")
+    logger.log(f"GBIF spelling corrections added to manually_verify (no mismatch, "
+               f"manual_verification_needed blank): {gbif_correction_count} records")
+    logger.log(f"Total rows in manually_verify file: {len(manually_verify_rows)} records")
+
     # Save log file
     logger.save()
     print(f"\nLog saved: {log_file}")
@@ -528,7 +600,8 @@ Outputs:
   {input_basename}_request_taxid.tsv  - Names to use as original (with GBIF hyperlinks)
   {input_basename}_check_ENA.xlsx      - Names to check in ENA with GBIF name (all input columns)
   {input_basename}_annotated.xlsx      - Full input with decision columns added
-  {input_basename}_manually_verify.xlsx - Rows needing manual verification (with decision columns)
+  {input_basename}_manually_verify.xlsx - Rows needing manual verification, plus all GBIF
+                                          spelling corrections (with decision columns)
   {input_basename}.log                  - Detailed processing log
 
 Example:

@@ -247,10 +247,16 @@ For each specimen the script:
 **Outputs:**
 | File | Description |
 |---|---|
-| `03_gbif_processor_original_name_request_form.tsv` | Ready-to-submit taxid request TSV where `name_to_use == original` records and no manual verification is required. Deduplicated by specimen name. Description column contains a GBIF species URL (`gbif_speciesKey`), falling back to the genus URL (`gbif_genusKey`) if the species key is absent. Type specimens have `\| TYPE` appended to the description. `name_type` is `published_name` for species-key matches or `novel_species` for genus-key fallbacks |
+| `03_gbif_processor_request_taxid.tsv` | Ready-to-submit taxid request TSV where `name_to_use == original` records and no manual verification is required. Deduplicated by specimen name. Description column contains a GBIF species URL (`gbif_speciesKey`). Type specimens have `\| TYPE` appended to the description. `name_type` is always `published_name` (genus-level and higher requests are handled in Step 2). Any `original` record without a `gbif_speciesKey` is not written here; it is flagged for manual verification instead |
 | `03_gbif_processor_check_ENA.xlsx` | Specimens where `name_to_use == gbif`, requiring ENA validation using the GBIF-matched name. Contains all input columns |
 | `03_gbif_processor_annotated.xlsx` | Full input for all records, with four appended decision columns: `name_to_use`, `description_text`, `check_ENA_with_GBIF`, `manual_verification_needed` |
-| `03_gbif_processor_manually_verify.xlsx` | All specimens flagged for manual verification (see Step 6). Contains all input columns plus decision columns |
+| `03_gbif_processor_manually_verify.xlsx` | All specimens flagged for manual verification, **plus** all GBIF spelling corrections (`name_to_use == gbif`, `check_ENA_with_GBIF == yes`), so every species still needing an ENA check is in this one file (see Step 6). Contains all input columns plus decision columns |
+
+**Higher taxonomy checks:** The rules matrix only compares name spellings, so the input higher taxonomy is also compared against the GBIF match (only where both values are present, case-insensitive):
+- **All records:** if the input `phylum` differs from `gbif_phylum`, `manual_verification_needed` is set to `yes`. This catches cross-phylum homonyms that ENA could not, because ENA only checks phylum when it already holds an exact name match (e.g. a bryozoan *Buchneria sicula* matched by GBIF to a millipede).
+- **GBIF spelling corrections:** if `phylum`, `class`, `order` **or** `family` differs, `manual_verification_needed` is set to `yes` (e.g. *Phalacronotus putoni*, supplied with catfish taxonomy, corrected by GBIF to the scarab beetle *Phalacronothus putoni*). Spelling corrections without a mismatch keep `manual_verification_needed` blank but still appear in `_manually_verify.xlsx` for their `confirmed_taxonomy` to be filled in.
+
+Each mismatch is written to the log as `→ PHYLUM MISMATCH: input '...' | GBIF '...'` (or CLASS/ORDER/FAMILY).
 
 **Example Log Output (per sample):**
 ```
@@ -283,14 +289,16 @@ Sample: BSUIO096-24
 
 **Purpose:** There is a chance some specimen taxonomy cannot be resolved programatically and requires manual taxonomic review to determine the correct, currently accepted scientific name before they can be submitted to ENA. These are written to `03_gbif_processor_annotated.xlsx` and `03_gbif_processor_manually_verify.xlsx` by the GBIF Name Processor (Step 5) and should be reviewed by a taxonomist or the submitting researcher before proceeding.
 
-For each record in `03_gbif_processor_annotated.xlsx`, filtered so that 'manual_verification_needed' == yes), decide on the accepted taxonomy, whether this is the original 'scientificName', 'gbif_species' name, or another name entirely. First append `confirmed_taxonomy` and `notes` column headings to the end of the file, and then:
+For each record in `03_gbif_processor_manually_verify.xlsx`, decide on the accepted taxonomy, whether this is the original 'scientificName', 'gbif_species' name, or another name entirely. This includes the GBIF spelling-correction records (`name_to_use == gbif` with `manual_verification_needed` blank), which usually only need the corrected `gbif_species` name confirming. First append a single `confirmed_taxonomy` and a single `notes` column heading to the end of the file (duplicate headings are renamed by pandas, e.g. `confirmed_taxonomy.1`, and will not be found by Steps 7–10), and then:
 - If the `scientificName` is valid and up to date, and GBIF is incorrect — copy the scientificName to the `confirmed_taxonomy` column (unchanged), and enter some supporting information (see below for guidance) in the 'notes' column.
 - If the `gbif_species` name is valid and up to date - copy the gbif_species name to the `confirmed_taxonomy` column (unchanged). Not supporting information is required in the 'notes' column as we have the gbif_speciesKey to reinforce our choice.
 - If neither the scientificName nor gbif_species names are correct (e.g. due to a misspelling of the scientificName) — provide the correct name in `confirmed_taxonomy` along with supporting evidence in the 'notes' column.
 
 > Supporting evidence in 'notes' could includes a link to a taxonomic database other than GBIF, or a literature reference. Useful resources for verification include [Catalogue of Life](https://www.catalogueoflife.org/), [ITIS](https://www.itis.gov/), [WoRMS](https://www.marinespecies.org/), [Index Fungorum](https://www.indexfungorum.org/), and relevant taxonomic literature.
 
-Save the completed file as `03_gbif_processor_annotated-man_ver_complete.xlsx` before proceeding.
+Only one taxid is needed per unique species, so the verified sheet may be deduplicated to one record per species (unlike non-species requests, which use per-specimen placeholder names). The four decision columns from Step 5 may be kept or removed: Step 7 works either way.
+
+Save the completed file as `03_gbif_processor_manually_verify-complete.xlsx` before proceeding.
 
 
 
@@ -305,7 +313,7 @@ Save the completed file as `03_gbif_processor_annotated-man_ver_complete.xlsx` b
 **Run:**
 ```bash
 python 04_post_ver_ena_check.py \
-    -i ./taxid_request/03_gbif_processor/03_gbif_processor_annotated-man_ver_complete.xlsx \
+    -i ./taxid_request/03_gbif_processor/03_gbif_processor_manually_verify-complete.xlsx \
     -o ./taxid_request/04_post_ver_ena_check/04_ena_post_ver.csv \
     --man_verify_col "confirmed_taxonomy"
 ```
@@ -317,7 +325,11 @@ python 04_post_ver_ena_check.py \
 | `--man_verify_col` | Name of the column containing verified/corrected names (default: `confirmed_taxonomy`) |
 
 **Logic:**
-Applies the same ENA API search logic as Step 3 but reads the corrected/confirmed name from `confirmed_taxonomy` rather than `scientificName` (where 'manual_verification_needed' == yes), or . This ensures that any name corrections made during manual verification are checked against ENA before proceeding further — a proportion of corrected names will already exist in ENA.
+Applies the same ENA API search logic as Step 3 but reads the corrected/confirmed name from `--man_verify_col` (default `confirmed_taxonomy`) rather than `scientificName`. This ensures that any name corrections made during manual verification are checked against ENA before proceeding further — a proportion of corrected names will already exist in ENA.
+
+Row selection depends on whether the Step 5 decision columns (`name_to_use`, `check_ENA_with_GBIF`, `manual_verification_needed`) are present:
+- **Not present** (e.g. a reviewed sheet with the decision columns removed): every record is searched using `--man_verify_col`.
+- **Present:** records with `manual_verification_needed == yes` are searched using `--man_verify_col`; GBIF spelling corrections (`name_to_use == gbif`, `check_ENA_with_GBIF == yes`) use `--man_verify_col` if filled in, otherwise `gbif_species`. All other records are excluded.
 
 For each sample, the script:
 1. **Gets the search term** from the specified column, stripping any ambiguous qualifiers (e.g. `Genus cf. species` → `Genus species`).
@@ -333,9 +345,9 @@ Same split structure as Step 3 (`-ena_matches.csv`, `-no_ena_matches.csv`, `-fil
 |---|---|
 | `results.csv` | All records with ENA columns appended |
 | `results-ena_matches.csv` | `MATCH_TAXONOMICALLY_CONSISTENT` — match found in ENA |
-| `results-errors.csv` | `SCIENTIFIC_NAME_EMPTY`, `API_ERROR:*` — could not be processed. Manual check required |
+| `results-errors.csv` | `MAN_VER_NAME_EMPTY`, `API_ERROR:*` — could not be processed. Manual check required |
 | `results-possible_homonym.csv` | `MATCH_PHYLUM_UNCHECKED`, `TAXONOMIC_MISMATCH_HOMONYM` — require manual check |
-| `results-no_ena_matches.csv` | `NO_EXACT_MATCH`, `NO_RESULTS_RETURNED` — may indicate naming issues, or taxa not yet registered in ENA |
+| `results-no_ena_matches.csv` | `NO_EXACT_MATCH`, `NO_RESULTS_RETURNED`, `TAXONOMIC_MISMATCH_HOMONYM` — may indicate naming issues, or taxa not yet registered in ENA. Homonym records are written to **both** this file and `-possible_homonym.csv`: ENA only holds the name in a different phylum, so the taxon itself still needs a taxid |
 | `results-filtered.csv` | All records except `MATCH_TAXONOMICALLY_CONSISTENT` |
 
 All input columns are preserved in every output file, with the following ENA columns appended:
@@ -372,18 +384,21 @@ python 05_gbif_ver_check.py \
 
 | Argument | Description |
 |---|---|
-| `--input` | Path to the no-ENA-match CSV from Step 7 |
-| `--output` | Path for the output CSV |
+| `-i` / `--input` | Path to the no-ENA-match file from Step 7 (`*-no_ena_matches.csv`; CSV, TSV or XLSX). Must contain `ID`, the search column, `ena_status_2`, `phylum` and `family` (`order` optional) |
+| `-o` / `--output` | Path for the output CSV (a timestamped `gbif_ver_check_*.log` is written alongside it) |
+| `--search-col` | Column containing the name to search (default: `confirmed_taxonomy`) |
 
 **Logic:**
-The processing logic is generally equivalent to Step 4, albeit using a simplified strategy suited to manually verified names. The homonym pre-check is skipped, but if `ena_status_2 == TAXONOMIC_MISMATCH_HOMONYM` is detected in the input, the search is automatically constrained by phylum and the event is recorded in `gbif_notes_2`. A fuzzy alternatives fallback is available for names that fail the standard search.
+The search strategy is the same as Step 4, applied to `confirmed_taxonomy` instead of `scientificName`.
 
 For each sample, the script:
-1. **Standard search with automatic disambiguation**: Queries `confirmed_taxonomy` against the GBIF backbone. If the initial result is too broad (usageKey = 1, rank is `KINGDOM` or `PHYLUM`, or no match is found) and higher taxonomy columns are present, a second disambiguated search is run with `phylum`, `order`, and/or `family` constraints.
-2. **Homonym handling**: If `ena_status_2 == TAXONOMIC_MISMATCH_HOMONYM`, the phylum-constrained search is used directly rather than first attempting an unconstrained search. The event is noted in `gbif_notes_2` as `homonym_detected;searched_with_phylum`.
-3. **Fuzzy alternatives fallback**: If no valid match is found after the standard/disambiguation step, the script queries GBIF with `verbose=True` to retrieve fuzzy alternative matches. Candidates are filtered by phylum and family where available, then ranked by confidence. The best fuzzy match is used if found, noted in `gbif_notes_2` as `suggested_match_from_fuzzy_alternative`.
+1. **Homonym handling**: If `ena_status_2 == TAXONOMIC_MISMATCH_HOMONYM`, a phylum-constrained search is used directly rather than first attempting an unconstrained search. Noted in `gbif_notes_2` as `homonym_resolved_with_phylum`.
+2. **Standard search with automatic disambiguation**: Otherwise, queries `confirmed_taxonomy` against the GBIF backbone. If the initial result is too broad (usageKey = 1, rank is `KINGDOM` or `PHYLUM`, or no match is found) and higher taxonomy columns are present, a second disambiguated search is run with `phylum`, `order`, and/or `family` constraints (`disambiguated_with_...`).
+3. **Fuzzy alternatives fallback**: If no valid match is found, the script queries GBIF with `verbose=True` to retrieve fuzzy alternative matches. Candidates are filtered by phylum and family where available, then ranked by confidence. The best fuzzy match is used if found, noted in `gbif_notes_2` as `suggested_match_from_fuzzy_alternative` — check these.
 
 A result is considered valid if it has a non-empty `usageKey` (not equal to 1), a `matchType` other than `NONE`, and a rank below `KINGDOM`/`PHYLUM`.
+
+Records are skipped (GBIF columns left as `NOT_FOUND`) if `ena_status_2 == MATCH_TAXONOMICALLY_CONSISTENT` (`skipped_ena_match`) or the search column is empty (`search_term_empty`).
 
 **Output:**
 All original input columns are preserved. The following `gbif_*_2` columns are inserted immediately after `ena_lineage_2`:
