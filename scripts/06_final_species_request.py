@@ -14,7 +14,8 @@ Workflow Context:
 Input Requirements:
     - Accepts CSV, TSV, or XLSX files
     - Must contain columns: confirmed_taxonomy, gbif_species_2, gbif_speciesKey_2,
-      type_status, ena_status_2, notes
+      type_status, ena_status_2, link
+    - Optional column: notes (used only when link is empty)
 
 Processing Logic:
     Records are processed according to the following rules:
@@ -31,9 +32,14 @@ Processing Logic:
     
     4. PROCESS: If confirmed_taxonomy != gbif_species_2
        - proposed_name = confirmed_taxonomy
-       - description = scientific reference extracted from notes column
-       - If no reference extractable, fall back to full notes text
-    
+       - description = the whole link cell, as entered during manual verification
+         (a URL, several URLs, URL + citation, or a citation without a URL).
+         Tabs/line breaks are collapsed to single spaces. Link cells with no
+         http(s):// URL are listed in the log.
+       - If link is empty: scientific reference extracted from the notes column,
+         falling back to the full notes text
+       - If link and notes are both empty: description left blank, row logged
+
     All processed records:
     - name_type = 'published_name'
     - " | TYPE" appended to description if type_status contains 'type'
@@ -175,6 +181,14 @@ def safe_str(value) -> str:
     return str(value).strip()
 
 
+URL_PATTERN = re.compile(r'https?://', re.IGNORECASE)
+
+
+def clean_link(value) -> str:
+    """Return the link cell as a single line: tabs/line breaks collapsed to single spaces."""
+    return ' '.join(safe_str(value).split())
+
+
 def get_gbif_url(gbif_key: str) -> str:
     """Generate GBIF species URL from key."""
     key = safe_str(gbif_key)
@@ -240,13 +254,15 @@ def process_file(input_file: str, output_dir: str = None, project_id: str = 'BGE
     # Validate required columns
     required_columns = [
         'confirmed_taxonomy', 'gbif_species_2', 'gbif_speciesKey_2',
-        'type_status', 'ena_status_2', 'notes'
+        'type_status', 'ena_status_2', 'link'
     ]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         logger.log(f"Error: Missing required columns: {missing_columns}")
         logger.write()
         sys.exit(1)
+    if 'notes' not in df.columns:
+        logger.log("  No 'notes' column found - rows with an empty link will get a blank description")
     
     # ID column for logging
     id_col = None
@@ -284,17 +300,21 @@ def process_file(input_file: str, output_dir: str = None, project_id: str = 'BGE
     
     skipped_ena = []
     matched_gbif = []          # CT == gbif_species_2
-    used_reference = []         # CT != gbif_species_2, reference extracted
-    used_notes_fallback = []    # CT != gbif_species_2, full notes used
-    empty_description = []      # CT != gbif_species_2, notes empty
-    
+    used_link = []              # CT != gbif_species_2, link cell used
+    link_no_url = []            # subset of used_link: link cell has no http(s):// URL
+    used_reference = []         # CT != gbif_species_2, link empty, reference extracted from notes
+    used_notes_fallback = []    # CT != gbif_species_2, link empty, full notes used
+    empty_description = []      # no description could be built (warnings)
+    no_evidence = []            # CT != gbif_species_2, link and notes both empty
+
     for idx, row in df.iterrows():
         row_id = safe_str(row[id_col]) if id_col else f"row_{idx}"
         confirmed_taxonomy = safe_str(row['confirmed_taxonomy'])
         gbif_species_2 = safe_str(row['gbif_species_2'])
         gbif_speciesKey_2 = safe_str(row['gbif_speciesKey_2'])
         ena_status_2 = safe_str(row['ena_status_2'])
-        notes = safe_str(row['notes'])
+        link = clean_link(row['link'])
+        notes = safe_str(row.get('notes', ''))
         type_status = safe_str(row.get('type_status', ''))
         is_type = is_type_specimen(type_status)
         
@@ -319,8 +339,16 @@ def process_file(input_file: str, output_dir: str = None, project_id: str = 'BGE
                 empty_description.append(
                     f"[{row_id}] {confirmed_taxonomy}: CT matches gbif_species_2 but no valid gbif_speciesKey_2"
                 )
+        elif link:
+            # CT differs from GBIF — use the curator's link cell as-is
+            description = link
+            processing_type = 'link'
+            used_link.append(row_id)
+            if not URL_PATTERN.search(link):
+                link_no_url.append(f"[{row_id}] {confirmed_taxonomy}: {link}")
+            logger.log(f"  [{row_id}] {confirmed_taxonomy}: link used → {link}", console=False)
         else:
-            # CT differs from GBIF — extract reference from notes
+            # CT differs from GBIF and link is empty — extract reference from notes
             ref, extracted = extract_reference(notes)
             if extracted:
                 description = ref
@@ -341,8 +369,9 @@ def process_file(input_file: str, output_dir: str = None, project_id: str = 'BGE
                 )
             else:
                 processing_type = 'no_description'
+                no_evidence.append(row_id)
                 empty_description.append(
-                    f"[{row_id}] {confirmed_taxonomy}: CT differs from gbif_species_2 but notes column is empty"
+                    f"[{row_id}] {confirmed_taxonomy}: CT differs from gbif_species_2 and link and notes are empty"
                 )
         
         # TYPE annotation
@@ -396,15 +425,25 @@ def process_file(input_file: str, output_dir: str = None, project_id: str = 'BGE
     logger.log(f"\nSkipped — ENA taxid found: {len(skipped_ena)}")
     
     logger.log(f"\nProcessed records by description source:")
-    logger.log(f"  CT == gbif_species_2 (GBIF URL):      {len(matched_gbif)}")
-    logger.log(f"  CT != gbif_species_2 (ref extracted):  {len(used_reference)}")
-    logger.log(f"  CT != gbif_species_2 (notes fallback): {len(used_notes_fallback)}")
-    
-    total_processed = len(matched_gbif) + len(used_reference) + len(used_notes_fallback)
+    no_description = len(no_evidence)
+    logger.log(f"  CT == gbif_species_2 (GBIF URL):                    {len(matched_gbif)}")
+    logger.log(f"  CT != gbif_species_2 (link):                        {len(used_link)}")
+    logger.log(f"    of which link has no URL (citation text used):    {len(link_no_url)}")
+    logger.log(f"  CT != gbif_species_2, no link (ref from notes):     {len(used_reference)}")
+    logger.log(f"  CT != gbif_species_2, no link (full notes text):    {len(used_notes_fallback)}")
+    logger.log(f"  CT != gbif_species_2, no link or notes (blank):     {no_description}")
+
+    total_processed = (len(matched_gbif) + len(used_link) + len(used_reference)
+                       + len(used_notes_fallback) + no_description)
     logger.log(f"\nTotal processed: {total_processed}")
     logger.log(f"Unique names in output: {len(output_rows)}")
     logger.log(f"Type specimens: {sum(1 for r in output_rows if '| TYPE' in r.get('description', ''))}")
     
+    if link_no_url:
+        logger.log(f"\nLink has no http(s):// URL — citation text used as description ({len(link_no_url)}):")
+        for w in link_no_url:
+            logger.log(f"    - {w}", console=False)
+
     if used_notes_fallback:
         logger.log(f"\nNotes fallback — no reference pattern found ({len(used_notes_fallback)}):")
         logger.log("  (Full notes text was used as description — review for accuracy)")
@@ -432,7 +471,8 @@ def main():
 Input:
   Accepts CSV, TSV, or XLSX files (auto-detected by extension)
   Must contain: confirmed_taxonomy, gbif_species_2, gbif_speciesKey_2,
-                type_status, ena_status_2, notes
+                type_status, ena_status_2, link
+  Optional:     notes (used only when link is empty)
 
 Output:
   {basename}_request_taxid.tsv - Names formatted for ENA taxonomy requests
@@ -442,8 +482,10 @@ Processing Rules:
   1. SKIP if ena_status_2 == 'MATCH_TAXONOMICALLY_CONSISTENT'
   2. ERROR if confirmed_taxonomy is empty (for non-skipped rows)
   3. If confirmed_taxonomy == gbif_species_2: description = GBIF URL
-  4. If confirmed_taxonomy != gbif_species_2: description = scientific reference
-     extracted from notes (falls back to full notes text if no reference found)
+  4. If confirmed_taxonomy != gbif_species_2: description = link cell as-is
+     5. If link is empty: scientific reference extracted from notes
+        (falls back to full notes text if no reference found)
+     6. If link and notes are empty: blank description, row listed in log
 
 Examples:
   python 06_final_species_request.py -i results_annotated.xlsx -p BGE

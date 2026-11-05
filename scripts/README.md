@@ -414,14 +414,16 @@ All original input columns are preserved. The following `gbif_*_2` columns are i
 
 ###  Step 9: Final Manual Verification
 
-**Purpose:** After round 2 of ENA matching and name variaiton searches using GBIF, one final (simpler) round of manual verification is required - this consists of double checking supporting literature references or other sensible supporting information (in the form of `valid species: [sensible supporting information] is entered into the 'notes' column created in the previous manual verification stage. This step is required for those samples where we forgo the suggested GBIF name, and therefore cannot use the relevant GBIF key as evidence in the 'description' column of the final request form.
+**Purpose:** After round 2 of ENA matching and name variation searches using GBIF, one final (simpler) round of manual verification is required. This step is required for those samples where `confirmed_taxonomy` differs from the round 2 GBIF name (`gbif_species_2`), and therefore the GBIF species key cannot be used as evidence in the 'description' column of the final request form.
+
+For these records, check that the **`link`** column holds the supporting evidence: preferably a URL (taxonomic database page, DOI, PDF of the description), otherwise a full literature citation. **The `link` cell is copied as-is into the request form `description`**, so it should contain only the evidence. The `notes` column is for the curator's reasoning and is only used if `link` is empty.
 
 **Examples:**
-| confirmed_taxonomy | notes (supporting information) |
-|---|---|
-| Glyptapanteles aliphera | GBIF out of date; I've followed the catalogue of Fernandez-Triana et al. (2020) |
-| Trogoxylon parallelipipedum | spelling error in Duff 2018- should be Trogoxylon parallelipipedum |
-| Tachyura walkeriana | GBIF out of date, I have followed Lobl & Lobl 2017 |
+| confirmed_taxonomy | link (copied to description) | notes (curator reasoning, not used if link is present) |
+|---|---|---|
+| Cerasma bakhmara | https://opuscula.elte.hu/PDF/Tomus56/Op_Olah_Caucasus_III.pdf | Described in Olah et al 2025 |
+| Glyptapanteles aliphera | Fernandez-Triana, J. et al. (2020). Annotated and illustrated world checklist of Microgastrinae parasitoid wasps. ZooKeys 920: 1–1089 | GBIF out of date |
+| Tachyura walkeriana | https://www.gbif.org/taxon/... | GBIF out of date, I have followed Lobl & Lobl 2017 |
 
 - Save the (final) manually reviewed and updated `05_post_ver_gbif_search.csv` file from Step 8, and proceed to the final step, Step 10.
 
@@ -451,11 +453,14 @@ python 06_final_species_request.py \
 
 **Logic:**
 For each record, the script determines the appropriate `description` field for the ENA request form using the following priority order:
-1. If `confirmed_taxonomy` matches the GBIF species name returned from round 2 searching → uses the GBIF species page URL as evidence
-2. If the names differ → attempts to extract a structured reference from the `notes` column (e.g. `"Author et al. (Year)"`)
-3. If no structured reference can be identified and extracted → falls back to the full `notes` column text
+1. If `confirmed_taxonomy` matches the GBIF species name returned from round 2 searching (`gbif_species_2`) → uses the GBIF species page URL (`gbif_speciesKey_2`) as evidence
+2. If the names differ → copies the whole `link` cell as-is (URL, several URLs, URL plus citation, or a citation on its own). Line breaks/tabs are collapsed to spaces so the TSV stays one row per name
+3. If `link` is empty → attempts to extract a structured reference from the `notes` column (e.g. `"Author et al. (Year)"`), falling back to the full `notes` text
+4. If `link` and `notes` are both empty → the description is left blank and the record is listed in the log
 
-- The script reports which evidence source was used for each record, and flags any cases where the notes fallback was used so you can review them before submission.
+Required columns: `confirmed_taxonomy`, `gbif_species_2`, `gbif_speciesKey_2`, `type_status`, `ena_status_2`, `link`. The `notes` column is optional (and must be named exactly `notes` to be used).
+
+- The script reports which evidence source was used for each record, lists `link` cells that contain no `http(s)://` URL (citation text used), and flags notes fallbacks and blank descriptions so you can review them before submission.
 **- The TSV produced here is the third and final request form. Set it aside for Step 11.**
 
 
