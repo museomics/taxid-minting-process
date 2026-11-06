@@ -483,3 +483,11 @@ cat [non-species_request_form.tsv] [first_species_request_form.tsv] [second_spec
 - Then, open the file and manually remove the duplicated column headers
 
 **Submit `combined_request_form.tsv` to ENA**
+
+
+---
+
+
+### Next: registering samples with ENA
+
+Samples whose taxa already have an ENA taxid can be registered with the ENA Tree of Life checklist. Use `01_tol_checklist_formatter.py` in [ena_read_upload](https://github.com/SchistoDan/ena_read_upload). It joins the original sample metadata to the taxids found here (01 and 04 `*-ena_matches.csv`, plus the manually verified sheets). It can also look up taxids that ENA mints after the request form is submitted.
