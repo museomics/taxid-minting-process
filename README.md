@@ -68,6 +68,8 @@ The pipeline expects a **CSV or TSV file** containing one row per specimen, with
 
 **`TAXONOMIC_MISMATCH_HOMONYM` records appearing.** This means a name exists in ENA but under a different phylum than expected. Always check that your input `phylum` column is correctly populated. If the phylum is correct, the GBIF search in Step 4 will use it to resolve the homonym.
 
+**`PHYLUM MISMATCH` / `FAMILY MISMATCH` lines in the GBIF processor log.** The GBIF match sits in a different phylum (any record) or different phylum/class/order/family (GBIF spelling corrections) from the input. These records are sent to manual verification. Either GBIF has matched a homonym, or the input higher taxonomy is wrong (e.g. assigned from a misspelled genus name that belongs to another group) — check which before confirming the name.
+
 **`MATCH_PHYLUM_UNCHECKED` records.** These occur when `phylum` is empty for a record and a match was found in ENA. The match may be correct but cannot be verified. Populate `phylum` and re-run, or review manually.
 
 ---
